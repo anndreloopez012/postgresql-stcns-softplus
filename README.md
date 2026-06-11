@@ -1,11 +1,12 @@
 # Guía corporativa para servidor Linux seguro con PostgreSQL en Docker, monitoreo y backups
 
-Documento técnico para instalar desde cero una plataforma PostgreSQL profesional sobre Linux usando Docker, Prometheus, Grafana, backups automáticos y buenas prácticas de seguridad.
+Documento técnico para instalar desde cero una plataforma PostgreSQL profesional sobre Debian usando Docker y Prometheus en el servidor de base de datos, Grafana en un servidor separado, backups automáticos y buenas prácticas de seguridad.
 
-> **Sistema base recomendado:** Ubuntu Server 24.04 LTS o 22.04 LTS x86_64.  
-> **Usuario ejemplo:** `opsadmin`.  
-> **Dominio/IP ejemplo:** `203.0.113.10`.  
-> **Directorio base:** `/opt/postgres-platform`.  
+> **Sistema base recomendado:** Debian 12 Bookworm o Debian 13 Trixie x86_64.
+> **Usuario ejemplo:** `opsadmin`.
+> **Servidor PostgreSQL/Prometheus ejemplo:** `203.0.113.10` público, `10.10.10.10` privado/VPN.
+> **Servidor Grafana ejemplo:** `203.0.113.20` público, `10.10.10.20` privado/VPN.
+> **Directorio base:** `/opt/postgres-platform`.
 > **Importante:** todo valor marcado como `CAMBIAR_CLIENTE` debe reemplazarse antes de producción.
 
 ---
@@ -169,13 +170,14 @@ Buenas prácticas iniciales:
 |---:|---|---|---|
 | 22 | SSH | Solo IP administrativa o VPN | Administración del servidor |
 | 5432 | PostgreSQL | No público; solo app/VPN/IP whitelist | Base de datos |
-| 3000 | Grafana | VPN, proxy HTTPS o IP whitelist | Dashboards |
-| 9090 | Prometheus | No público | Métricas internas |
-| 9100 | Node Exporter | No público | Métricas del servidor |
-| 9187 | PostgreSQL Exporter | No público | Métricas PostgreSQL |
+| 3000 | Grafana | Solo en servidor Grafana; VPN, proxy HTTPS o IP whitelist | Dashboards |
+| 19090 | Prometheus publicado en host | Solo red privada/VPN desde servidor Grafana | Métricas internas; se usa `19090` para evitar conflicto con Prometheus local en `9090` |
+| 9090 | Prometheus dentro del contenedor | No se expone directamente | Puerto interno del contenedor |
+| 9100 | Node Exporter | No público | Métricas del servidor, solo red Docker interna |
+| 9187 | PostgreSQL Exporter | No público | Métricas PostgreSQL, solo red Docker interna |
 | 5050 | pgAdmin opcional | VPN, proxy HTTPS o IP whitelist | Administración visual |
 
-> **No exponer públicamente:** `9090`, `9100`, `9187`.  
+> **No exponer públicamente:** `9090`, `9100`, `9187`, `19090`.
 > **Evitar exponer públicamente:** `5432`, `5050`, `3000`. Usar VPN, IP whitelist o reverse proxy con HTTPS y autenticación.
 
 ### 2.2 Configurar UFW
@@ -194,12 +196,23 @@ sudo ufw allow from 198.51.100.20 to any port 22 proto tcp comment 'SSH admin'
 # PostgreSQL solo desde servidor de aplicación o VPN
 sudo ufw allow from 198.51.100.30 to any port 5432 proto tcp comment 'PostgreSQL app server'
 
-# Grafana solo desde IP administrativa o VPN
-sudo ufw allow from 198.51.100.20 to any port 3000 proto tcp comment 'Grafana admin'
+# Prometheus solo desde el servidor Grafana por red privada/VPN
+sudo ufw allow from 10.10.10.20 to any port 19090 proto tcp comment 'Prometheus para Grafana'
 
 # pgAdmin opcional, solo administración
 sudo ufw allow from 198.51.100.20 to any port 5050 proto tcp comment 'pgAdmin admin'
 
+sudo ufw enable
+sudo ufw status verbose
+```
+
+En el servidor Grafana separado, permitir el puerto `3000` solo a administradores o al reverse proxy:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow from 198.51.100.20 to any port 22 proto tcp comment 'SSH admin Grafana'
+sudo ufw allow from 198.51.100.20 to any port 3000 proto tcp comment 'Grafana admin'
 sudo ufw enable
 sudo ufw status verbose
 ```
@@ -224,7 +237,7 @@ Docker manipula reglas `iptables` y los puertos publicados con `ports:` pueden q
 - Publique servicios administrativos solo en `127.0.0.1` si se accederán por túnel SSH o reverse proxy.
 - No publique exporters hacia Internet.
 - Use la cadena `DOCKER-USER` para controles estrictos si necesita filtrar tráfico Docker a nivel host.
-- Prefiera VPN privada para PostgreSQL, Prometheus, exporters y pgAdmin.
+- Prefiera VPN privada para PostgreSQL, Prometheus, exporters, pgAdmin y la comunicación Grafana -> Prometheus.
 
 ### 2.4 Instalar y configurar Fail2Ban
 
@@ -274,36 +287,40 @@ Recomendaciones para producción:
 
 ---
 
-## 3. Instalación de Docker y Docker Compose
+## 3. Instalación de Docker y Docker Compose en Debian
 
-Las instrucciones siguen el método recomendado por Docker: repositorio oficial `apt` y plugin moderno `docker compose`.
+Las instrucciones siguen el método recomendado por Docker para Debian: repositorio oficial `apt` y plugin moderno `docker compose`.
 
-### 3.1 Instalar Docker Engine
+### 3.1 Instalar Docker Engine en Debian
 
-**Copiar y pegar:**
+**Copiar y pegar en el servidor PostgreSQL/Prometheus:**
 
 ```bash
-# Remover paquetes conflictivos si existen
-for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+# Confirmar Debian soportado: Debian 12 Bookworm o Debian 13 Trixie recomendado.
+. /etc/os-release
+echo "$PRETTY_NAME"
+
+# Remover paquetes conflictivos si existen.
+for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
   sudo apt-get remove -y "$pkg" 2>/dev/null || true
 done
 
-# Instalar dependencias
+# Instalar dependencias.
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl
 
-# Agregar llave GPG oficial
+# Agregar llave GPG oficial de Docker para Debian.
 sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
 
-# Agregar repositorio oficial
+# Agregar repositorio oficial de Docker para Debian.
 echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
   sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-# Instalar Docker y Compose moderno
+# Instalar Docker Engine y Compose moderno.
 sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 ```
@@ -339,7 +356,7 @@ docker run --rm hello-world
 Crear estructura:
 
 ```bash
-sudo mkdir -p /opt/postgres-platform/{backups,postgres/init,prometheus,grafana/provisioning/datasources,grafana/provisioning/dashboards,grafana/dashboards,scripts,docs,logs}
+sudo mkdir -p /opt/postgres-platform/{backups,postgres/init,prometheus,scripts,docs,logs}
 sudo chown -R "$USER":"$USER" /opt/postgres-platform
 chmod 750 /opt/postgres-platform
 cd /opt/postgres-platform
@@ -348,6 +365,7 @@ cd /opt/postgres-platform
 Estructura esperada:
 
 ```text
+Servidor PostgreSQL/Prometheus:
 /opt/postgres-platform/
 ├── docker-compose.yml
 ├── .env
@@ -356,11 +374,6 @@ Estructura esperada:
 │   └── init/
 ├── prometheus/
 │   └── prometheus.yml
-├── grafana/
-│   ├── dashboards/
-│   └── provisioning/
-│       ├── dashboards/
-│       └── datasources/
 ├── scripts/
 ├── logs/
 └── docs/
@@ -375,7 +388,6 @@ Uso de carpetas:
 | `/opt/postgres-platform/backups/` | Backups comprimidos de PostgreSQL |
 | `/opt/postgres-platform/postgres/init/` | Scripts SQL opcionales de inicialización |
 | `/opt/postgres-platform/prometheus/` | Configuración de Prometheus |
-| `/opt/postgres-platform/grafana/` | Dashboards y provisioning de Grafana |
 | `/opt/postgres-platform/scripts/` | Scripts operativos de backup/restauración |
 | `/opt/postgres-platform/logs/` | Logs generados por scripts |
 | `/opt/postgres-platform/docs/` | Documentación interna del cliente |
@@ -430,23 +442,20 @@ POSTGRES_EXPORTER_CONTAINER_NAME=postgres-exporter
 POSTGRES_EXPORTER_PORT=9187
 
 ###############################################################################
-# Prometheus
+# Prometheus en servidor PostgreSQL
 ###############################################################################
 PROMETHEUS_IMAGE=prom/prometheus:v2.54.1
-PROMETHEUS_CONTAINER_NAME=prometheus
-PROMETHEUS_HOST_PORT=9090
+PROMETHEUS_CONTAINER_NAME=postgres-platform-prometheus
+
+# Se publica en 19090 para evitar conflicto con instalaciones Prometheus existentes en 9090.
+# Usar IP privada/VPN del servidor PostgreSQL. Ejemplo: 10.10.10.10.
+# Si Grafana NO está en otro servidor, puede usarse 127.0.0.1.
+PROMETHEUS_BIND_ADDRESS=10.10.10.10
+PROMETHEUS_HOST_PORT=19090
+PROMETHEUS_INTERNAL_PORT=9090
 PROMETHEUS_RETENTION_TIME=30d
 PROMETHEUS_RETENTION_SIZE=10GB
 
-###############################################################################
-# Grafana
-###############################################################################
-GRAFANA_IMAGE=grafana/grafana-oss:11.2.2
-GRAFANA_CONTAINER_NAME=grafana
-GRAFANA_HOST_PORT=3000
-GRAFANA_ADMIN_USER=admin
-GRAFANA_ADMIN_PASSWORD=CAMBIAR_CLIENTE_Grafana_Admin_ClaveLarga
-GRAFANA_ALLOW_SIGN_UP=false
 
 ###############################################################################
 # pgAdmin opcional
@@ -471,6 +480,7 @@ BACKUP_COMPRESSION_LEVEL=6
 ###############################################################################
 # Si PostgreSQL no debe exponerse externamente, cambiar en docker-compose.yml:
 # "5432:5432" por "127.0.0.1:5432:5432" o eliminar ports y usar solo red interna.
+# Prometheus debe quedar accesible solo desde el servidor Grafana por IP privada/VPN.
 ```
 
 Proteger archivo:
@@ -489,7 +499,9 @@ El resultado debe mostrar valores pendientes. Antes de producción, no debe qued
 
 ---
 
-## 6. Docker Compose completo
+## 6. Docker Compose completo para servidor PostgreSQL/Prometheus
+
+Este `docker-compose.yml` se ejecuta en el servidor Debian de base de datos. No incluye Grafana, porque Grafana se instalará en otro servidor.
 
 Crear archivo:
 
@@ -548,8 +560,6 @@ services:
     networks:
       - monitoring
       - db_internal
-    # El exporter queda validado desde Prometheus en /targets.
-    # Algunas imágenes minimalistas no incluyen curl/wget para healthcheck local.
     logging:
       driver: json-file
       options:
@@ -591,8 +601,9 @@ services:
       - "--storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE}"
       - "--web.enable-lifecycle"
     ports:
-      # Recomendado: publicar solo por VPN o 127.0.0.1 detrás de reverse proxy.
-      - "${PROMETHEUS_HOST_PORT}:9090"
+      # Host 19090 -> contenedor 9090 evita conflicto con Prometheus del host en 9090.
+      # PROMETHEUS_BIND_ADDRESS debe ser IP privada/VPN, no 0.0.0.0 en producción.
+      - "${PROMETHEUS_BIND_ADDRESS}:${PROMETHEUS_HOST_PORT}:${PROMETHEUS_INTERNAL_PORT}"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -606,39 +617,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
-    security_opt:
-      - no-new-privileges:true
-
-  grafana:
-    image: ${GRAFANA_IMAGE}
-    container_name: ${GRAFANA_CONTAINER_NAME}
-    restart: unless-stopped
-    environment:
-      TZ: ${TZ}
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
-      GF_USERS_ALLOW_SIGN_UP: ${GRAFANA_ALLOW_SIGN_UP}
-      GF_AUTH_ANONYMOUS_ENABLED: "false"
-      GF_SECURITY_DISABLE_GRAVATAR: "true"
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
-    ports:
-      - "${GRAFANA_HOST_PORT}:3000"
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
-    depends_on:
-      prometheus:
-        condition: service_healthy
-    networks:
-      - monitoring
-    # La salud HTTP de Grafana se valida externamente con /api/health.
-    # Algunas variantes de imagen no incluyen curl/wget dentro del contenedor.
     logging:
       driver: json-file
       options:
@@ -686,7 +664,6 @@ volumes:
   postgres_data:
     name: ${POSTGRES_DATA_VOLUME}
   prometheus_data:
-  grafana_data:
   pgadmin_data:
 ```
 
@@ -698,6 +675,8 @@ docker compose config
 ```
 
 > pgAdmin está bajo perfil `admin`. Para levantar pgAdmin use `docker compose --profile admin up -d`.
+
+> Si `docker compose up -d` falla por bind de Prometheus, revise que `PROMETHEUS_BIND_ADDRESS` exista en el servidor con `ip addr` y que `PROMETHEUS_HOST_PORT` no esté ocupado.
 
 ---
 
@@ -903,14 +882,22 @@ scrape_configs:
 Validar:
 
 ```bash
+cd /opt/postgres-platform
+set -a
+source .env
+set +a
 docker compose restart prometheus
-curl -s http://127.0.0.1:9090/-/healthy
+curl -s http://${PROMETHEUS_BIND_ADDRESS}:${PROMETHEUS_HOST_PORT}/-/healthy
 ```
 
 Ver targets:
 
 ```bash
-curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[] | {job: .labels.job, health: .health, lastError: .lastError}'
+cd /opt/postgres-platform
+set -a
+source .env
+set +a
+curl -s http://${PROMETHEUS_BIND_ADDRESS}:${PROMETHEUS_HOST_PORT}/api/v1/targets | jq '.data.activeTargets[] | {job: .labels.job, health: .health, lastError: .lastError}'
 ```
 
 Buenas prácticas:
@@ -922,14 +909,95 @@ Buenas prácticas:
 
 ---
 
-## 9. Configuración de Grafana
+## 9. Instalación y configuración de Grafana en servidor separado
 
-### 9.1 Provisionar datasource de Prometheus
+Grafana se instala en un segundo servidor Debian. Este servidor consulta Prometheus en el servidor PostgreSQL por red privada/VPN usando `http://10.10.10.10:19090` como ejemplo.
 
-Crear archivo:
+### 9.1 Preparar servidor Grafana
+
+Actualizar Debian e instalar herramientas base:
 
 ```bash
-nano /opt/postgres-platform/grafana/provisioning/datasources/prometheus.yml
+sudo apt update
+sudo apt -y upgrade
+sudo apt install -y ca-certificates curl gnupg apt-transport-https ufw fail2ban nano jq
+sudo timedatectl set-timezone America/Guatemala
+```
+
+Aplicar firewall mínimo:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow from 198.51.100.20 to any port 22 proto tcp comment 'SSH admin Grafana'
+sudo ufw allow from 198.51.100.20 to any port 3000 proto tcp comment 'Grafana admin'
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Validar conectividad desde el servidor Grafana hacia Prometheus:
+
+```bash
+curl -s http://10.10.10.10:19090/-/healthy
+curl -s http://10.10.10.10:19090/api/v1/targets | jq '.data.activeTargets[] | {job: .labels.job, health: .health}'
+```
+
+### 9.2 Instalar Grafana con repositorio oficial APT
+
+**Copiar y pegar en el servidor Grafana:**
+
+```bash
+sudo apt-get install -y apt-transport-https software-properties-common wget
+sudo mkdir -p /etc/apt/keyrings/
+wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/grafana.gpg > /dev/null
+
+echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" | \
+  sudo tee /etc/apt/sources.list.d/grafana.list
+
+sudo apt-get update
+sudo apt-get install -y grafana
+sudo systemctl enable --now grafana-server
+sudo systemctl status grafana-server --no-pager
+```
+
+Validar:
+
+```bash
+curl -s http://127.0.0.1:3000/api/health | jq
+```
+
+### 9.3 Acceso a Grafana
+
+Abrir desde una IP autorizada:
+
+```text
+http://IP_SERVIDOR_GRAFANA:3000
+```
+
+Credenciales iniciales por defecto:
+
+```text
+Usuario: admin
+Contraseña: admin
+```
+
+Grafana solicitará cambiar la contraseña en el primer ingreso. Use una contraseña larga y única.
+
+### 9.4 Agregar Prometheus como datasource
+
+Opción UI:
+
+1. Entrar a Grafana.
+2. Ir a `Connections` -> `Data sources`.
+3. Seleccionar `Prometheus`.
+4. URL: `http://10.10.10.10:19090`.
+5. Guardar y probar con `Save & test`.
+
+Opción provisioning por archivo:
+
+```bash
+sudo mkdir -p /etc/grafana/provisioning/datasources
+sudo nano /etc/grafana/provisioning/datasources/prometheus.yml
 ```
 
 **Copiar y pegar:**
@@ -942,17 +1010,24 @@ datasources:
     uid: Prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:9090
+    url: http://10.10.10.10:19090
     isDefault: true
     editable: true
 ```
 
-### 9.2 Provisionar carpeta de dashboards
-
-Crear archivo:
+Reiniciar Grafana:
 
 ```bash
-nano /opt/postgres-platform/grafana/provisioning/dashboards/dashboards.yml
+sudo systemctl restart grafana-server
+sudo systemctl status grafana-server --no-pager
+```
+
+### 9.5 Provisionar carpeta local para dashboards
+
+```bash
+sudo mkdir -p /var/lib/grafana/dashboards/postgres-platform
+sudo chown -R grafana:grafana /var/lib/grafana/dashboards
+sudo nano /etc/grafana/provisioning/dashboards/postgres-platform.yml
 ```
 
 **Copiar y pegar:**
@@ -969,35 +1044,20 @@ providers:
     updateIntervalSeconds: 30
     allowUiUpdates: true
     options:
-      path: /var/lib/grafana/dashboards
+      path: /var/lib/grafana/dashboards/postgres-platform
 ```
 
-Reiniciar Grafana:
-
-```bash
-docker compose restart grafana
-```
-
-### 9.3 Acceso a Grafana
-
-Abrir:
+El dashboard JSON de la sección siguiente debe guardarse en:
 
 ```text
-http://IP_DEL_SERVIDOR:3000
-```
-
-Credenciales iniciales:
-
-```text
-Usuario: definido en GRAFANA_ADMIN_USER
-Contraseña: definida en GRAFANA_ADMIN_PASSWORD
+/var/lib/grafana/dashboards/postgres-platform/postgresql-platform-overview.json
 ```
 
 Recomendaciones:
 
-- Cambiar la contraseña inicial después del primer ingreso.
-- No habilitar registro público.
-- Usar HTTPS mediante reverse proxy si se accede fuera de VPN.
+- No instalar Grafana dentro del compose del servidor PostgreSQL.
+- Proteger Grafana con VPN, IP whitelist o reverse proxy HTTPS.
+- Deshabilitar usuarios anónimos.
 - Crear usuarios nominales, no compartidos.
 - Organizar dashboards por carpetas: `Infraestructura`, `PostgreSQL`, `Backups`, `Aplicaciones`.
 
@@ -1008,7 +1068,7 @@ Recomendaciones:
 Crear archivo:
 
 ```bash
-nano /opt/postgres-platform/grafana/dashboards/postgresql-platform-overview.json
+sudo nano /var/lib/grafana/dashboards/postgres-platform/postgresql-platform-overview.json
 ```
 
 **Copiar y pegar:**
@@ -1200,10 +1260,11 @@ nano /opt/postgres-platform/grafana/dashboards/postgresql-platform-overview.json
 
 > Consultas lentas: PostgreSQL no expone queries lentas por defecto en estas métricas. Para monitorearlas correctamente, habilitar `pg_stat_statements` y extender el exporter con queries customizadas.
 
-Reiniciar Grafana:
+Reiniciar Grafana en el servidor Grafana:
 
 ```bash
-docker compose restart grafana
+sudo chown grafana:grafana /var/lib/grafana/dashboards/postgres-platform/postgresql-platform-overview.json
+sudo systemctl restart grafana-server
 ```
 
 ---
@@ -1491,14 +1552,13 @@ Ver logs:
 ```bash
 docker compose logs -f --tail=100 postgres
 docker compose logs -f --tail=100 prometheus
-docker compose logs -f --tail=100 grafana
 ```
 
 Reiniciar servicios:
 
 ```bash
 docker compose restart postgres
-docker compose restart prometheus grafana
+docker compose restart prometheus
 ```
 
 Validar recursos:
@@ -1535,8 +1595,9 @@ Procedimiento recomendado de actualización:
 3. Ejecutar backup manual.
 4. Descargar imágenes nuevas.
 5. Levantar contenedores.
-6. Validar PostgreSQL, Prometheus, Grafana y backups.
-7. Documentar versión anterior y nueva.
+6. Validar PostgreSQL, Prometheus y backups en el servidor de base de datos.
+7. Validar Grafana por separado en el servidor Grafana.
+8. Documentar versión anterior y nueva.
 
 No hacer upgrade mayor de PostgreSQL, por ejemplo 15 a 16, sin procedimiento específico de migración y backup probado.
 
@@ -1567,10 +1628,10 @@ Revisar `.env`, volumen, permisos, versión de imagen y puerto.
 ### Puerto ocupado
 
 ```bash
-sudo ss -ltnp | grep ':5432\|:3000\|:9090'
+sudo ss -ltnp | grep ':5432\|:5050\|:19090\|:9090\|:3000'
 ```
 
-Cambiar puerto en `.env` o detener el servicio que ocupa el puerto.
+Cambiar puerto en `.env`, ajustar `PROMETHEUS_HOST_PORT=19090` si ya está ocupado, o detener el servicio que ocupa el puerto.
 
 ### Error de permisos en volúmenes
 
@@ -1584,19 +1645,22 @@ No cambiar permisos internos del volumen sin diagnóstico. PostgreSQL requiere o
 
 ### Grafana no conecta a Prometheus
 
+En el servidor Grafana:
+
 ```bash
-docker exec -it grafana wget -qO- http://prometheus:9090/-/healthy
-docker compose logs --tail=100 grafana
+curl -v http://10.10.10.10:19090/-/healthy
+curl -s http://10.10.10.10:19090/api/v1/targets | jq
+sudo journalctl -u grafana-server -n 100 --no-pager
 ```
 
-Validar datasource `http://prometheus:9090` y red `monitoring`.
+Validar que el datasource use `http://10.10.10.10:19090`, que el firewall del servidor PostgreSQL permita la IP privada/VPN del servidor Grafana y que `PROMETHEUS_BIND_ADDRESS` no sea `127.0.0.1` cuando Grafana está en otro servidor.
 
 ### Prometheus no detecta exporters
 
 ```bash
 docker exec -it prometheus wget -qO- http://node-exporter:9100/metrics | head
 docker exec -it prometheus wget -qO- http://postgres-exporter:9187/metrics | head
-curl -s http://127.0.0.1:9090/api/v1/targets | jq
+curl -s http://${PROMETHEUS_BIND_ADDRESS}:${PROMETHEUS_HOST_PORT}/api/v1/targets | jq
 ```
 
 Revisar `prometheus.yml`, nombres de servicios y healthchecks.
@@ -1653,14 +1717,14 @@ Revisar variables, puertos, permisos, memoria insuficiente y dependencias.
 
 ## 15. Recomendaciones adicionales
 
-- Configurar HTTPS para Grafana y pgAdmin mediante Nginx, Caddy o Traefik si se accede fuera de VPN.
+- Configurar HTTPS para Grafana en su servidor separado y para pgAdmin mediante Nginx, Caddy o Traefik si se accede fuera de VPN.
 - Usar VPN o red privada para PostgreSQL, Prometheus y exporters.
 - Implementar alertas: disco mayor a 80%, PostgreSQL caído, backups fallidos, CPU sostenida alta, memoria baja.
 - Enviar backups a almacenamiento externo cifrado: S3, Cloudflare R2, Backblaze B2 o NAS.
 - Cifrar discos o volúmenes si el proveedor lo permite.
 - Documentar responsables de acceso y rotación de credenciales.
 - Probar restauración en un ambiente separado antes de considerar el sistema listo.
-- Mantener inventario de versiones: sistema operativo, Docker, PostgreSQL, Grafana, Prometheus.
+- Mantener inventario de versiones: Debian, Docker, PostgreSQL, Grafana y Prometheus.
 - Evaluar `pg_stat_statements` para análisis de consultas lentas.
 - Evaluar PgBouncer si la aplicación abre muchas conexiones.
 - Definir RPO y RTO con el negocio.
@@ -1679,12 +1743,12 @@ Revisar variables, puertos, permisos, memoria insuficiente y dependencias.
 | Fail2Ban activo | ☐ |
 | Docker funcionando | ☐ |
 | Docker Compose moderno funcionando | ☐ |
-| Estructura `/opt/postgres-platform` creada | ☐ |
+| Estructura `/opt/postgres-platform` creada en servidor PostgreSQL/Prometheus | ☐ |
 | `.env` configurado sin `CAMBIAR_CLIENTE` | ☐ |
 | PostgreSQL funcionando | ☐ |
 | PostgreSQL no expuesto públicamente sin control | ☐ |
-| Prometheus recolectando métricas | ☐ |
-| Grafana accesible y protegido | ☐ |
+| Prometheus recolectando métricas y publicado en `19090` solo por red privada/VPN | ☐ |
+| Grafana instalado en servidor separado, accesible y protegido | ☐ |
 | Dashboard importado | ☐ |
 | Backup manual probado | ☐ |
 | Crontab activo | ☐ |
@@ -1697,6 +1761,7 @@ Revisar variables, puertos, permisos, memoria insuficiente y dependencias.
 
 ## 17. Referencias oficiales consultadas
 
-- [Docker Engine en Ubuntu](https://docs.docker.com/installation/ubuntulinux/)
+- [Docker Engine en Debian](https://docs.docker.com/engine/install/debian/)
 - [Docker Compose plugin en Linux](https://docs.docker.com/compose/install/linux/)
+- [Instalación de Grafana en Debian o Ubuntu](https://grafana.com/docs/grafana/latest/setup-grafana/installation/debian/)
 - [Referencia de Docker Compose](https://docs.docker.com/reference/compose-file/)
